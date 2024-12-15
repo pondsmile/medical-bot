@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -26,8 +27,7 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 # Global variables
 PDF_CONTENT = None
 GEMINI_MODEL = None
-CHAT_SESSION = None
-USER_CONTEXTS = {}  # เก็บบริบทของผู้ใช้แต่ละคน
+USER_CONTEXTS = {}
 
 
 def extract_pdf_content():
@@ -42,6 +42,32 @@ def extract_pdf_content():
         return ""
 
 
+def is_relevant_question(question, pdf_content):
+    # สร้าง prompt เพื่อตรวจสอบความเกี่ยวข้องกับ PDF
+    check_prompt = f"""
+    ประเมินว่าคำถามต่อไปนี้เกี่ยวข้องกับเนื้อหาใน PDF หรือไม่:
+
+    คำถาม: {question}
+
+    เนื้อหา PDF:
+    {pdf_content[:1000]}  # ใช้เพียงบางส่วนเพื่อประหยัดโควตา
+
+    ตอบเพียง "ใช่" หากคำถามเกี่ยวข้องกับเนื้อหาใน PDF 
+    ตอบเพียง "ไม่" หากคำถามไม่เกี่ยวข้อง
+    """
+
+    try:
+        check_model = genai.GenerativeModel('gemini-pro')
+        response = check_model.generate_content(check_prompt)
+
+        # ตรวจสอบคำตอบ
+        answer = response.text.strip().lower()
+        return "ใช่" in answer
+    except Exception as e:
+        logging.error(f"Error checking question relevance: {e}")
+        return False
+
+
 def initialize_ai_model(user_id):
     global PDF_CONTENT, GEMINI_MODEL
 
@@ -51,8 +77,8 @@ def initialize_ai_model(user_id):
 
     # สร้าง model
     generation_config = {
-        "temperature": 0.7,
-        "top_p": 0.95,
+        "temperature": 0.2,
+        "top_p": 0.8,
         "max_output_tokens": 2048,
     }
 
@@ -63,17 +89,21 @@ def initialize_ai_model(user_id):
 
     # เตรียม initial prompt
     initial_prompt = f"""
-    คุณเป็น AI ผู้ช่วยที่มีความรู้เกี่ยวกับข้อมูลบริการทางการแพทย์
-    มีข้อมูลเอกสารอ้างอิงดังนี้:
-    {PDF_CONTENT}
+    คุณเป็น AI ผู้ช่วยที่ให้ข้อมูลเฉพาะจากเอกสารบริการทางการแพทย์เท่านั้น
 
-    โปรดตอบคำถามอย่างชัดเจน กระชับ และเป็นมิตร
+    กฎสำคัญ:
+    1. ตอบเฉพาะคำถามที่เกี่ยวข้องกับเนื้อหาใน PDF นี้
+    2. หากไม่มีข้อมูลในเอกสาร ให้ตอบว่า "ขออภัย ไม่พบข้อมูลที่ตรงกับคำถาม"
+    3. ห้ามตอบคำถามที่อยู่นอกเหนือเอกสาร
+
+    ข้อมูลในเอกสาร:
+    {PDF_CONTENT}
     """
 
     # สร้าง chat session สำหรับผู้ใช้แต่ละคน
     user_contexts = GEMINI_MODEL.start_chat(history=[
         {"role": "user", "parts": [initial_prompt]},
-        {"role": "model", "parts": ["เข้าใจแล้วค่ะ พร้อมช่วยเหลือ"]}
+        {"role": "model", "parts": ["เข้าใจแล้วค่ะ จะตอบเฉพาะข้อมูลใน PDF"]}
     ])
 
     # บันทึก context ของผู้ใช้
@@ -82,7 +112,12 @@ def initialize_ai_model(user_id):
 
 
 def get_gemini_response(user_id, question):
+    global PDF_CONTENT
     try:
+        # ตรวจสอบความเกี่ยวข้องของคำถาม
+        if not is_relevant_question(question, PDF_CONTENT):
+            return "ขออภัย สามารถสอบถามเฉพาะข้อมูลจากเอกสารบริการทางการแพทย์เท่านั้นค่ะ"
+
         # ตรวจสอบ context ของผู้ใช้
         if user_id not in USER_CONTEXTS:
             chat_session = initialize_ai_model(user_id)
