@@ -23,6 +23,12 @@ app = Flask(__name__)
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
+# Global variables
+PDF_CONTENT = None
+GEMINI_MODEL = None
+CHAT_SESSION = None
+USER_CONTEXTS = {}  # เก็บบริบทของผู้ใช้แต่ละคน
+
 
 def extract_pdf_content():
     try:
@@ -36,48 +42,64 @@ def extract_pdf_content():
         return ""
 
 
-# Load PDF content
-PDF_CONTENT = extract_pdf_content()
+def initialize_ai_model(user_id):
+    global PDF_CONTENT, GEMINI_MODEL
+
+    # โหลด PDF เพียงครั้งเดียว
+    if PDF_CONTENT is None:
+        PDF_CONTENT = extract_pdf_content()
+
+    # สร้าง model
+    generation_config = {
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "max_output_tokens": 2048,
+    }
+
+    GEMINI_MODEL = genai.GenerativeModel(
+        model_name="gemini-pro",
+        generation_config=generation_config,
+    )
+
+    # เตรียม initial prompt
+    initial_prompt = f"""
+    คุณเป็น AI ผู้ช่วยที่มีความรู้เกี่ยวกับข้อมูลบริการทางการแพทย์
+    มีข้อมูลเอกสารอ้างอิงดังนี้:
+    {PDF_CONTENT}
+
+    โปรดตอบคำถามอย่างชัดเจน กระชับ และเป็นมิตร
+    """
+
+    # สร้าง chat session สำหรับผู้ใช้แต่ละคน
+    user_contexts = GEMINI_MODEL.start_chat(history=[
+        {"role": "user", "parts": [initial_prompt]},
+        {"role": "model", "parts": ["เข้าใจแล้วค่ะ พร้อมช่วยเหลือ"]}
+    ])
+
+    # บันทึก context ของผู้ใช้
+    USER_CONTEXTS[user_id] = user_contexts
+    return user_contexts
 
 
-def get_gemini_response(question):
+def get_gemini_response(user_id, question):
     try:
-        # กำหนดค่าการสร้างข้อความ
-        generation_config = {
-            "temperature": 0.7,
-            "top_p": 0.95,
-            "max_output_tokens": 2048,
-        }
-
-        # สร้างโมเดล
-        model = genai.GenerativeModel(
-            model_name="gemini-pro",
-            generation_config=generation_config,
-        )
-
-        # สร้างพร้อมท์
-        prompt = f"""
-        คุณเป็น AI ผู้ช่วยที่ช่วยอ่านข้อมูลเอกสารและตอบคำถามเกี่ยวกับข้อมูลในเอกสาร 
-        ให้คุณตอบคำถามด้วยภาษาพูดที่สุภาพและกระชับ โดยไม่ต้องอ้างอิงว่ามาจากเอกสาร 
-        ตอบตรงคำถาม เช่น:
-        - หากถาม \"ราคานี้เท่าไหร่?\" ให้ตอบ \"ราคาที่คุณถามอยู่ 150 บาทค่ะ\"
-        - หากถาม \"เวลาทำการคือกี่โมง?\" ให้ตอบ \"8 โมงเช้าถึง 5 โมงเย็นค่ะ\"
-        ข้อมูลในเอกสาร:
-        {PDF_CONTENT}
-        คำถาม: {question}
-        คำตอบ:
-        """
-
-        # เริ่มเซสชันแชท
-        chat_session = model.start_chat(history=[])
+        # ตรวจสอบ context ของผู้ใช้
+        if user_id not in USER_CONTEXTS:
+            chat_session = initialize_ai_model(user_id)
+        else:
+            chat_session = USER_CONTEXTS[user_id]
 
         # ส่งคำถาม
-        response = chat_session.send_message(prompt)
-
+        response = chat_session.send_message(question)
         return response.text
 
     except Exception as e:
         logging.error(f"Error getting response from Gemini AI: {e}")
+
+        # หากเกิด quota error หรือ rate limit
+        if "429" in str(e) or "Resource has been exhausted" in str(e):
+            return "ขออภัย ระบบกำลังมีผู้ใช้งานหนาแน่น กรุณารอสักครู่แล้วลองใหม่อีกครั้งค่ะ"
+
         return "ขออภัย ไม่สามารถประมวลผลคำถามได้ในขณะนี้ค่ะ"
 
 
@@ -94,21 +116,31 @@ def callback():
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
+    user_id = event.source.user_id
     user_question = event.message.text
-    logging.info(f"Received message: {user_question}")
+    logging.info(f"Received message from {user_id}: {user_question}")
 
     try:
-        response = get_gemini_response(user_question)
+        # ส่งข้อความรอก่อน
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="กรุณารอสักครู่ กำลังประมวลผล...")
+        )
+
+        # ประมวลผลคำตอบ
+        response = get_gemini_response(user_id, user_question)
         logging.info(f"Generated response: {response}")
 
-        line_bot_api.reply_message(
-            event.reply_token,
+        # ส่งคำตอบกลับ
+        line_bot_api.push_message(
+            user_id,
             TextSendMessage(text=response)
         )
+
     except Exception as e:
         logging.error(f"Error handling message: {e}")
-        line_bot_api.reply_message(
-            event.reply_token,
+        line_bot_api.push_message(
+            user_id,
             TextSendMessage(text="ขออภัย เกิดข้อผิดพลาดในการประมวลผล")
         )
 
