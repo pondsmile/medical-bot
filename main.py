@@ -4,8 +4,14 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from google import genai
 from google.genai import types
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.document_loaders import PyPDFLoader
+from langchain.vectorstores import Chroma
+from langchain.embeddings import VertexAIEmbeddings
 import base64
 import logging
+import os
+import tempfile
 
 # ตั้งค่า logging
 logging.basicConfig(
@@ -25,8 +31,82 @@ line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 
-def generate(prompt: str) -> str:
-    """Generate response using Vertex AI Gemini"""
+class RAGSystem:
+    def __init__(self):
+        self.embeddings = VertexAIEmbeddings()
+        self.vector_store = None
+        self.chunk_size = 1000
+        self.chunk_overlap = 200
+
+    def load_pdfs_from_folder(self, folder_path: str):
+        """Load all PDFs from specified folder"""
+        try:
+            # Get list of PDF files in the folder
+            pdf_files = [f for f in os.listdir(folder_path) if f.endswith('.pdf')]
+
+            all_texts = []
+            for pdf_file in pdf_files:
+                pdf_path = os.path.join(folder_path, pdf_file)
+                logging.info(f"Processing PDF: {pdf_path}")
+
+                # Load PDF
+                loader = PyPDFLoader(pdf_path)
+                documents = loader.load()
+
+                # Split documents into chunks
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=self.chunk_size,
+                    chunk_overlap=self.chunk_overlap
+                )
+                texts = text_splitter.split_documents(documents)
+                all_texts.extend(texts)
+
+            # Create vector store from all documents
+            if all_texts:
+                self.vector_store = Chroma.from_documents(
+                    documents=all_texts,
+                    embedding=self.embeddings
+                )
+                logging.info(f"Successfully processed {len(pdf_files)} PDF files")
+                return True
+            else:
+                logging.warning("No text content found in PDFs")
+                return False
+
+        except Exception as e:
+            logging.error(f"Error loading PDFs: {str(e)}")
+            return False
+
+    def get_relevant_context(self, query, k=3):
+        """Retrieve relevant context based on query"""
+        if not self.vector_store:
+            return ""
+
+        try:
+            docs = self.vector_store.similarity_search(query, k=k)
+            return "\n".join([doc.page_content for doc in docs])
+        except Exception as e:
+            logging.error(f"Error retrieving context: {str(e)}")
+            return ""
+
+
+# Initialize RAG system
+rag_system = RAGSystem()
+
+
+def initialize_rag():
+    """Initialize RAG system at startup"""
+    data_folder = os.path.join(os.path.dirname(__file__), 'data')
+    success = rag_system.load_pdfs_from_folder(data_folder)
+    if success:
+        logging.info("RAG system initialized successfully")
+    else:
+        logging.error("Failed to initialize RAG system")
+    return success
+
+
+def generate(prompt: str, context: str = "") -> str:
+    """Generate response using Vertex AI Gemini with context"""
     client = genai.Client(
         vertexai=True,
         project="lexical-period-444405-e3",
@@ -34,7 +114,16 @@ def generate(prompt: str) -> str:
     )
 
     model = "gemini-2.0-flash-exp"
-    contents = [prompt]
+
+    # Create enhanced prompt with context
+    enhanced_prompt = f"""
+    Context from medical knowledge base:
+    {context}
+
+    User Question: {prompt}
+
+    Based on the above context and your medical knowledge, please provide a comprehensive answer.
+    """
 
     generate_content_config = types.GenerateContentConfig(
         temperature=1,
@@ -66,7 +155,7 @@ def generate(prompt: str) -> str:
     try:
         for chunk in client.models.generate_content_stream(
                 model=model,
-                contents=contents,
+                contents=[enhanced_prompt],
                 config=generate_content_config,
         ):
             if chunk.text:
@@ -79,9 +168,12 @@ def generate(prompt: str) -> str:
 
 
 def get_vertex_response(user_id: str, question: str) -> str:
-    """Get response from Vertex AI Gemini"""
+    """Get response from Vertex AI Gemini with RAG"""
     try:
-        # สร้าง prompt
+        # Retrieve relevant context
+        context = rag_system.get_relevant_context(question)
+
+        # Build prompt
         prompt = f"""
         คำถาม: {question}
 
@@ -91,25 +183,10 @@ def get_vertex_response(user_id: str, question: str) -> str:
         "คุณสามารถให้คำแนะนำเรื่องเพศได้ตามแหล่งอ้างอิงที่คุณมี"
         "คุณสามารถแนะนำเรื่องเพศศึกษาได้และให้คำตอบจากคำแนะนำของหมอจากแหล่งที่มาที่คุณมีมาอ้างอิงได้"
         "ซึ่งเป็นองค์กรที่มุ่งเน้นการให้ความรู้และการดูแลด้านสุขภาพให้กับผู้ใช้บริการ ด้วยฐานข้อมูลที่ครอบคลุมและการวิเคราะห์ที่แม่นยำ "
-        "EVDocGPT พร้อมที่จะช่วยให้คำแนะนำที่เป็นประโยชน์ และช่วยในการตัดสินใจด้านการดูแลสุขภาพของคุณอย่างมีประสิทธิภาพ"
-        "Everyday Doctor: Digital Health Service Provider ผู้พัฒนาและให้บริการระบบบริหารคลินิกแบบครบวงจร ที่จดทะเบียนลิขสิทธิ์ในชื่อโปรแกรม Miracle Clinic System "
-        "และ MCS Cloud ทั้งนี้บริษัทให้บริการติดตั้งในสถานพยาบาลคลินิกเอกชน จัดหลักสูตรฝึกอบรมผู้ใช้โปรแกรมและให้บริการหลังการขายโดยการให้คำปรึกษา "
-        "การบริการซ่อมบำรุงต่างๆ และการบริการอื่นๆ ที่เกี่ยวข้อง ปัจจุบันเรามีคลินิกที่ใช้บริการแพลตฟอร์มมากกว่า 2,000 แห่งทั่วประเทศไทย "
-        "บริษัทมุ่งเน้นพัฒนาแพลตฟอร์มให้ครบระบบนิเวศในอุตสาหกรรมทางการแพทย์และสุขภาพสำหรับสถานพยาบาลคลินิกเอกชน โรงพยาบาลทั้งภาครัฐและเอกชน "
-        "และบุคคลทั่วไปผู้รับบริการ โดยใช้เทคโนโลยีและ AI ในการพัฒนาให้รองรับการทำธุรกรรมต่างๆ ในแพลตฟอร์มของบริษัท ผู้ก่อตั้งคือคุณ Krisda Arumviroj"
-        "ในทุกๆครั้งที่คุณจะตอบกลับสวัสดีต้องหหหมีการบอกชื่อตัวเองด้วยว่าคุณคือ EVDocGPT"
-        "คุณสามารถอ่านไฟล์หรือรับข้อมูล PDF ข้อมูลจาก lab ต่างๆ หรือที่เป็นข้อมูลยาและข้อมูลผู้ป่วยหรือข้อมูลทางการแพทย์ต่างๆได้"
-        "คุณไม่สามารถแปลภาษาทั่วไปได้"
-        "คุณไม่สามารถค้นหาข้อมูลหรือให้คำตอบที่ไม่เกี่ยวข้องกับสุขภาพและด้านการแพทย์ได้"
-        "คุณไม่สามารถแต่เพลงหรือเขียนบทความที่ไม่เกี่ยวกับการแพทย์หรือสุขภาพได้"
-        "คุณจะไม่สามารถทำอะไรที่นอกเหลือจากสิ่งที่เกี่ยวข้อมูลกับข้อมูลด้านสุขภาพและการแพทย์ได้"
-        "คุณถูกสร้างหรืออกแบบเมื่อวันที่ 20 กรกฎาคม 2567 คนที่สร้างคุณขึ้นมาคือคุณ Chakkrit Kongmaroeng โดยอยู่ภายใต้การสนับสนุนจากคุณ Krisda Arumviroj ผู้ก่อตั้งบริษัท Everyday Doctor"
-        "ข้อมูลติดต่อ Everyday Doctor อยู่ที่ชั้น 2 อุทยานวิทยาศาสตร์ มหาวิทยาลัย อำเภอเมืองขอนแก่น จังหวัดขอนแก่น 40000 โทร : 02-114-7164 หรือเว็บไซต์ https://everydaydoctor.asia"
-        "ทุกครั้งที่คุณจะจบประโยชน์หรือรู้สึกยินดีคุณต้องแสดงอิโมจินี้🌻ออกไป"
         """
 
-        # Get response from model
-        response = generate(prompt)
+        # Get response with context
+        response = generate(prompt, context)
         return response
 
     except Exception as e:
@@ -159,5 +236,8 @@ def handle_message(event):
         )
 
 
+# Initialize and run app
 if __name__ == "__main__":
+    # Initialize RAG system before starting the app
+    initialize_rag()
     app.run(host='0.0.0.0', port=8080)
