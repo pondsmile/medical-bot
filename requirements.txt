@@ -6,5 +6,6 @@ langchain-google-vertexai
 requests
 pythainlp
 pypdf
+PyPDF2
 faiss-cpu
 google-genai
