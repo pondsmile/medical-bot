@@ -9,11 +9,10 @@ from linebot.v3.exceptions import InvalidSignatureError
 import os
 import PyPDF2
 import re
-from google import genai
-from google.genai import types
 import logging
 import json
 import vertexai
+from vertexai.language_models import TextGenerationModel
 
 # ตั้งค่า logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,218 +24,7 @@ LINE_CHANNEL_ACCESS_TOKEN = 'S57WX85ldXlMWLDXqYMgwAFRFVsQ9PYjIzp5Ov8d1YV+U6yHvCl
 # Initialize Vertex AI
 vertexai.init(project="lexical-period-444405-e3", location="us-central1")
 
-
-class PDFContentManager:
-    def __init__(self, pdf_folder="data"):
-        self.pdf_folder = pdf_folder
-        self.document_categories = {}
-        self.content_sections = []
-        self.load_or_create_content()
-
-    def categorize_document(self, text, filename):
-        text_lower = text.lower()
-        categories = []
-
-        if any(word in text_lower for word in ['ค่ารักษา', 'ราคา', 'ค่าบริการ', 'อัตรา']):
-            categories.append('pricing')
-        if any(word in text_lower for word in ['โรค', 'อาการ', 'การรักษา', 'วินิจฉัย']):
-            categories.append('medical')
-        if any(word in text_lower for word in ['ขั้นตอน', 'วิธี', 'กระบวนการ']):
-            categories.append('procedure')
-        if any(word in text_lower for word in ['นโยบาย', 'ระเบียบ', 'ข้อบังคับ']):
-            categories.append('policy')
-
-        if not categories:
-            categories.append('general')
-
-        return categories
-
-    def extract_section_metadata(self, section):
-        metadata = {
-            'type': 'unknown',
-            'keywords': set(),
-            'numbers': [],
-            'has_pricing': False
-        }
-
-        text_lower = section.lower()
-
-        if any(word in text_lower for word in ['บาท', 'ราคา', 'ค่า']):
-            metadata['type'] = 'pricing'
-            metadata['has_pricing'] = True
-        elif any(word in text_lower for word in ['ขั้นตอน', 'วิธี']):
-            metadata['type'] = 'procedure'
-        elif any(word in text_lower for word in ['โรค', 'อาการ']):
-            metadata['type'] = 'medical'
-
-        important_words = [word for word in text_lower.split()
-                           if len(word) > 3 and not word.isdigit()]
-        metadata['keywords'] = set(important_words[:10])
-
-        numbers = re.findall(r'\d+(?:,\d+)*(?:\.\d+)?', section)
-        metadata['numbers'] = [float(num.replace(',', '')) for num in numbers]
-
-        return metadata
-
-    def split_into_logical_sections(self, text):
-        sections = []
-        current_section = ""
-
-        for line in text.split('\n'):
-            line = line.strip()
-            if not line:
-                continue
-
-            if (re.match(r'^\d+\.', line) or
-                    re.match(r'^[ก-ฮ]\.', line) or
-                    line.isupper() or
-                    any(line.startswith(prefix) for prefix in ['เรื่อง', 'บทที่', 'ส่วนที่'])):
-
-                if current_section:
-                    sections.append(current_section)
-                current_section = line
-            else:
-                current_section += "\n" + line
-
-        if current_section:
-            sections.append(current_section)
-
-        return sections
-
-    def process_pdf_content(self):
-        self.content_sections = []
-        self.document_categories = {}
-
-        for filename in os.listdir(self.pdf_folder):
-            if filename.endswith('.pdf'):
-                try:
-                    file_path = os.path.join(self.pdf_folder, filename)
-                    with open(file_path, 'rb') as file:
-                        reader = PyPDF2.PdfReader(file)
-                        full_text = ""
-
-                        for page in reader.pages:
-                            full_text += page.extract_text() + "\n"
-
-                        categories = self.categorize_document(full_text, filename)
-                        self.document_categories[filename] = categories
-
-                        sections = self.split_into_logical_sections(full_text)
-
-                        for section in sections:
-                            if len(section.strip()) > 10:
-                                metadata = self.extract_section_metadata(section)
-                                self.content_sections.append({
-                                    'content': section.strip(),
-                                    'source': filename,
-                                    'categories': categories,
-                                    'metadata': metadata
-                                })
-
-                        logging.info(f"ประมวลผลไฟล์ {filename} สำเร็จ (ประเภท: {categories})")
-
-                except Exception as e:
-                    logging.error(f"เกิดข้อผิดพลาดในการประมวลผลไฟล์ {filename}: {e}")
-
-    def find_relevant_content(self, query, max_sections=3):
-        query_lower = query.lower()
-        scored_sections = []
-
-        query_words = set(query_lower.split())
-
-        for section in self.content_sections:
-            score = 0
-            content_lower = section['content'].lower()
-            metadata = section['metadata']
-
-            matching_keywords = query_words.intersection(metadata['keywords'])
-            score += len(matching_keywords) * 2
-
-            for word in query_words:
-                if len(word) > 3 and word in content_lower:
-                    score += 1
-
-            if ('ราคา' in query_lower or 'ค่า' in query_lower) and metadata['has_pricing']:
-                score += 3
-
-            if score > 0:
-                scored_sections.append((score, section))
-
-        scored_sections.sort(key=lambda x: x[0], reverse=True)
-        return [section for score, section in scored_sections[:max_sections]]
-
-    def create_response_context(self, query, relevant_sections):
-        context_parts = []
-        for section in relevant_sections:
-            source = section['source']
-            categories = ', '.join(section['categories'])
-            context_parts.append(f"ข้อมูลจาก {source} (ประเภท: {categories}):\n{section['content']}")
-
-        context = "\n\n".join(context_parts)
-
-        prompt = f"""คุณเป็น AI ที่ถูกจำกัดให้ตอบเฉพาะข้อมูลที่มีในเอกสารอ้างอิงเท่านั้น
-
-        คำถาม: {query}
-
-        ข้อมูลอ้างอิง:
-        {context}
-
-        กฎในการตอบ:
-        1. ตอบเฉพาะข้อมูลที่มีในเอกสารอ้างอิงข้างต้นเท่านั้น
-        2. ห้ามเพิ่มเติมหรือสันนิษฐานข้อมูลนอกเหนือจากเอกสาร
-        3. ถ้าไม่มีข้อมูลในเอกสาร ให้ตอบว่า "ขออภัย ไม่พบข้อมูลที่เกี่ยวข้องในเอกสาร"
-        4. อ้างอิงที่มาของข้อมูลเสมอ
-        5. ถ้าเป็นข้อมูลราคา ให้แสดงรายละเอียดทั้งหมดที่มี
-        6. ลงท้ายด้วย 🌻
-
-        คำตอบ:"""
-
-        return prompt
-
-    def save_content(self):
-        os.makedirs("knowledge_base", exist_ok=True)
-        data = {
-            'categories': self.document_categories,
-            'sections': [{
-                'content': section['content'],
-                'source': section['source'],
-                'categories': section['categories'],
-                'metadata': {
-                    'type': section['metadata']['type'],
-                    'has_pricing': section['metadata']['has_pricing'],
-                    'numbers': section['metadata']['numbers']
-                }
-            } for section in self.content_sections]
-        }
-        with open("knowledge_base/processed_content.json", "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        logging.info("บันทึกข้อมูลที่ประมวลผลแล้วสำเร็จ")
-
-    def load_or_create_content(self):
-        try:
-            with open("knowledge_base/processed_content.json", "r", encoding="utf-8") as f:
-                data = json.load(f)
-                self.document_categories = data['categories']
-                self.content_sections = data['sections']
-                for section in self.content_sections:
-                    section['metadata']['keywords'] = set()  # Initialize empty set for keywords
-            logging.info("โหลดข้อมูลที่ประมวลผลแล้วสำเร็จ")
-        except:
-            logging.info("ไม่พบข้อมูลที่ประมวลผลแล้ว กำลังประมวลผลใหม่...")
-            self.process_pdf_content()
-            self.save_content()
-
-    def update_content(self):
-        self.process_pdf_content()
-        self.save_content()
-        return "อัพเดทข้อมูลจากไฟล์ PDF เรียบร้อยแล้ว 🌻"
-
-
-import logging
-import vertexai
-from vertexai.language_models import TextGenerationModel
-
-
+# เพิ่ม VertexAIHandler class
 class VertexAIHandler:
     def __init__(self):
         try:
@@ -245,11 +33,9 @@ class VertexAIHandler:
                 project="lexical-period-444405-e3",
                 location="us-central1"
             )
-
             # Initialize the text model
             self.model = TextGenerationModel.from_pretrained("text-bison@002")
             logging.info("VertexAI Handler initialized successfully")
-
         except Exception as e:
             logging.error(f"Failed to initialize VertexAI Handler: {e}")
             raise
@@ -268,6 +54,271 @@ class VertexAIHandler:
             logging.error(f"Error generating response: {e}")
             return "ขออภัย เกิดข้อผิดพลาดในการประมวลผล กรุณาลองใหม่อีกครั้ง 🌻"
 
+class PDFProcessor:
+    def __init__(self, pdf_folder="data"):
+        self.pdf_folder = pdf_folder
+        self.doc_buffer = []
+
+    def _clean_text(self, text):
+        """ทำความสะอาดข้อความ"""
+        text = re.sub(r'\s+', ' ', text)  # แทนที่ whitespace หลายตัวด้วยช่องว่างเดียว
+        text = text.strip()
+        return text
+
+    def _extract_prices(self, text):
+        """แยกราคาจากข้อความ"""
+        prices = re.findall(r'\d+(?:,\d{3})*(?:\.\d+)?(?:\s*-\s*\d+(?:,\d{3})*(?:\.\d+)?)?(?=\s*บาท)', text)
+        return [p.replace(',', '') for p in prices]
+
+    def _identify_content_type(self, text):
+        """ระบุประเภทของเนื้อหา"""
+        text_lower = text.lower()
+        categories = []
+
+        # ตรวจสอบหมวดหมู่
+        if any(word in text_lower for word in ['ราคา', 'บาท', 'ค่า']):
+            categories.append('pricing')
+        if any(word in text_lower for word in ['ขั้นตอน', 'วิธี', 'กระบวนการ']):
+            categories.append('procedure')
+        if any(word in text_lower for word in ['รักษา', 'การรักษา']):
+            categories.append('treatment')
+        if any(word in text_lower for word in ['อาการ', 'โรค']):
+            categories.append('symptom')
+
+        if not categories:
+            categories.append('general')
+
+        return categories
+
+    def _extract_section_metadata(self, text):
+        """ดึงข้อมูล metadata จากส่วนเนื้อหา"""
+        return {
+            'categories': self._identify_content_type(text),
+            'prices': self._extract_prices(text),
+            'word_count': len(text.split()),
+            'has_table': bool(re.search(r'\|\s*\w+\s*\|', text))
+        }
+
+    def process_pdf_content(self):
+        """ประมวลผลเนื้อหาจากไฟล์ PDF ทั้งหมด"""
+        documents = []
+
+        for filename in os.listdir(self.pdf_folder):
+            if filename.endswith('.pdf'):
+                file_path = os.path.join(self.pdf_folder, filename)
+                try:
+                    with open(file_path, 'rb') as file:
+                        reader = PyPDF2.PdfReader(file)
+                        text = ""
+
+                        # รวมเนื้อหาทั้งหมดจากทุกหน้า
+                        for page in reader.pages:
+                            text += page.extract_text() + "\n"
+
+                        # แบ่งเนื้อหาเป็นส่วนๆ
+                        sections = self._split_into_sections(text)
+
+                        # เพิ่ม metadata และเก็บข้อมูล
+                        for section in sections:
+                            clean_text = self._clean_text(section)
+                            if len(clean_text) > 50:  # ข้ามส่วนที่สั้นเกินไป
+                                metadata = self._extract_section_metadata(clean_text)
+                                documents.append({
+                                    'content': clean_text,
+                                    'source': filename,
+                                    'metadata': metadata
+                                })
+
+                        logging.info(f"ประมวลผลไฟล์ {filename} สำเร็จ")
+
+                except Exception as e:
+                    logging.error(f"เกิดข้อผิดพลาดในการประมวลผลไฟล์ {filename}: {e}")
+
+        return documents
+
+    def _split_into_sections(self, text):
+        """แบ่งเนื้อหาเป็นส่วนๆ ตามโครงสร้าง"""
+        sections = []
+        current_section = ""
+
+        for line in text.split('\n'):
+            if self._is_new_section(line):
+                if current_section.strip():
+                    sections.append(current_section.strip())
+                current_section = line
+            else:
+                current_section += "\n" + line
+
+        if current_section.strip():
+            sections.append(current_section.strip())
+
+        return sections
+
+    def _is_new_section(self, line):
+        """ตรวจสอบว่าเป็นหัวข้อใหม่หรือไม่"""
+        patterns = [
+            r'^\d+\.[\d\.]*\s+\w+',  # เช่น "1.", "1.1.", "1.1.1."
+            r'^[ก-ฮ]\.\s+\w+',  # เช่น "ก."
+            r'^[A-Z][A-Za-z\s]+:',  # เช่น "Section:"
+            r'^[\u0E01-\u0E5B]+:',  # หัวข้อภาษาไทยตามด้วย ":"
+        ]
+        return any(re.match(pattern, line.strip()) for pattern in patterns)
+
+
+class SemanticSearch:
+    def __init__(self):
+        self.vertex_handler = VertexAIHandler()
+        self.documents = []
+
+    def update_documents(self, documents):
+        """อัพเดทฐานข้อมูลเอกสาร"""
+        self.documents = documents
+
+    def search(self, query, top_k=3):
+        """ค้นหาเนื้อหาที่เกี่ยวข้องที่สุด"""
+        try:
+            # สร้าง prompt สำหรับการค้นหา
+            search_prompt = f"""
+            กรุณาวิเคราะห์และเลือกเนื้อหาที่เกี่ยวข้องที่สุดกับคำถามต่อไปนี้:
+
+            คำถาม: {query}
+
+            เนื้อหาที่มี:
+            {self._format_documents()}
+
+            โปรดเลือกและส่งคืนเฉพาะส่วนที่เกี่ยวข้องโดยตรง โดยคงไว้ซึ่งแหล่งที่มาของข้อมูล (ชื่อไฟล์)
+            ตอบในรูปแบบ:
+            [ชื่อไฟล์]
+            เนื้อหาที่เกี่ยวข้อง
+            """
+
+            response = self.vertex_handler.generate_response(search_prompt)
+
+            return self._parse_search_response(response)
+
+        except Exception as e:
+            logging.error(f"เกิดข้อผิดพลาดในการค้นหา: {e}")
+            return []
+
+    def _format_documents(self):
+        """จัดรูปแบบเอกสารสำหรับการค้นหา"""
+        formatted_docs = []
+        for doc in self.documents:
+            categories = ', '.join(doc['metadata']['categories'])
+            formatted_docs.append(
+                f"[{doc['source']} | {categories}]\n{doc['content']}"
+            )
+        return "\n\n".join(formatted_docs)
+
+    def _parse_search_response(self, response):
+        """แยกผลลัพธ์การค้นหา"""
+        sections = []
+        current_section = {'source': None, 'content': ''}
+
+        for line in response.split('\n'):
+            if line.strip():
+                if line.startswith('[') and ']' in line:
+                    if current_section['source']:
+                        sections.append(current_section)
+                    source = line[1:line.index(']')]
+                    current_section = {
+                        'source': source,
+                        'content': line[line.index(']') + 1:].strip()
+                    }
+                else:
+                    current_section['content'] += '\n' + line.strip()
+
+        if current_section['source']:
+            sections.append(current_section)
+
+        return sections
+
+
+class ResponseGenerator:
+    def __init__(self):
+        self.vertex_handler = VertexAIHandler()
+
+    def generate(self, query: str, relevant_sections: list) -> str:
+        """สร้างคำตอบจากข้อมูลที่เกี่ยวข้อง"""
+        if not relevant_sections:
+            return "ขออภัย ไม่พบข้อมูลที่เกี่ยวข้องในเอกสาร 🌻"
+
+        # สร้าง context จากส่วนที่เกี่ยวข้อง
+        context = "\n\n".join([
+            f"จาก {section['source']}:\n{section['content']}"
+            for section in relevant_sections
+        ])
+
+        prompt = f"""คุณคือ EVDocGPT ผู้ช่วยตอบคำถามด้านการแพทย์และทันตกรรม
+
+        คำถาม: {query}
+
+        ข้อมูลอ้างอิง:
+        {context}
+
+        กรุณาตอบโดย:
+        1. ใช้เฉพาะข้อมูลจากเอกสารอ้างอิงเท่านั้น
+        2. ถ้าเป็นข้อมูลราคา ให้แสดงรายละเอียดทั้งหมดที่มี
+        3. อ้างอิงที่มาของข้อมูลเสมอ
+        4. ตอบให้กระชับและตรงประเด็น
+        5. ถ้าไม่มีข้อมูลในเอกสาร ให้แจ้งว่าไม่พบข้อมูล
+        6. ลงท้ายด้วย 🌻"""
+
+        try:
+            response = self.vertex_handler.generate_response(prompt)
+            return response
+        except Exception as e:
+            logging.error(f"เกิดข้อผิดพลาดในการสร้างคำตอบ: {e}")
+            return "ขออภัย เกิดข้อผิดพลาดในการประมวลผล กรุณาลองใหม่อีกครั้ง 🌻"
+
+
+class RAGSystem:
+    def __init__(self, pdf_folder="data"):
+        self.pdf_processor = PDFProcessor(pdf_folder)
+        self.semantic_search = SemanticSearch()
+        self.response_generator = ResponseGenerator()
+        self.load_or_create_knowledge_base()
+
+    def load_or_create_knowledge_base(self):
+        """โหลดหรือสร้างฐานความรู้ใหม่"""
+        try:
+            with open("knowledge_base/documents.json", "r", encoding="utf-8") as f:
+                documents = json.load(f)
+                self.semantic_search.update_documents(documents)
+                logging.info("โหลดฐานความรู้ที่มีอยู่สำเร็จ")
+        except:
+            logging.info("ไม่พบฐานความรู้เดิม กำลังสร้างใหม่...")
+            self.update_knowledge_base()
+
+    def update_knowledge_base(self):
+        """อัพเดทฐานความรู้"""
+        try:
+            documents = self.pdf_processor.process_pdf_content()
+            self.semantic_search.update_documents(documents)
+
+            os.makedirs("knowledge_base", exist_ok=True)
+            with open("knowledge_base/documents.json", "w", encoding="utf-8") as f:
+                json.dump(documents, f, ensure_ascii=False, indent=2)
+
+            logging.info("อัพเดทฐานความรู้สำเร็จ")
+            return "เรียนรู้ข้อมูลจากไฟล์ PDF ใหม่เรียบร้อยแล้ว 🌻"
+        except Exception as e:
+            logging.error(f"เกิดข้อผิดพลาดในการอัพเดทฐานความรู้: {e}")
+            return "เกิดข้อผิดพลาดในการอัพเดทฐานความรู้ กรุณาลองใหม่อีกครั้ง 🌻"
+
+    def get_response(self, query: str) -> str:
+        """ค้นหาและสร้างคำตอบ"""
+        try:
+            # ค้นหาเนื้อหาที่เกี่ยวข้อง
+            relevant_sections = self.semantic_search.search(query)
+
+            # สร้างคำตอบ
+            response = self.response_generator.generate(query, relevant_sections)
+            return response
+        except Exception as e:
+            logging.error(f"เกิดข้อผิดพลาดในการสร้างคำตอบ: {e}")
+            return "ขออภัย เกิดข้อผิดพลาดในการประมวลผล กรุณาลองใหม่อีกครั้ง 🌻"
+
 
 # Initialize Flask and LINE
 app = Flask(__name__)
@@ -276,9 +327,8 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 api_client = ApiClient(configuration)
 line_bot_api = MessagingApi(api_client)
 
-# Initialize Content Manager and Vertex AI Handler
-content_manager = PDFContentManager()
-vertex_handler = VertexAIHandler()
+# Initialize RAG System
+rag_system = RAGSystem()
 
 
 @app.route("/callback", methods=['POST'])
@@ -303,20 +353,18 @@ def handle_message(event):
         line_bot_api.reply_message_with_http_info(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
-                messages=[TextMessage(text="กรุณารอสักครู่ กำลังประมวลผล...")]
+                messages=[TextMessage(text="กรุณารอสักครู่ กำลังค้นหาข้อมูล...")]
             )
         )
 
+        # ตรวจสอบคำสั่งพิเศษ
         if user_question.strip().lower() == "เรียนรู้ข้อมูลจาก pdf ใหม่หน่อย":
-            response = content_manager.update_content()
+            response = rag_system.update_knowledge_base()
         else:
-            relevant_sections = content_manager.find_relevant_content(user_question)
-            if not relevant_sections:
-                response = "ขออภัย ไม่พบข้อมูลที่เกี่ยวข้องในเอกสาร 🌻"
-            else:
-                prompt = content_manager.create_response_context(user_question, relevant_sections)
-                response = vertex_handler.generate_response(prompt)
+            # ค้นหาและสร้างคำตอบ
+            response = rag_system.get_response(user_question)
 
+        # ส่งคำตอบกลับ
         line_bot_api.push_message_with_http_info(
             PushMessageRequest(
                 to=user_id,
@@ -335,4 +383,8 @@ def handle_message(event):
 
 
 if __name__ == "__main__":
+    # Make sure the knowledge_base directory exists
+    os.makedirs("knowledge_base", exist_ok=True)
+
+    # Run the Flask app
     app.run(host='0.0.0.0', port=8080)
