@@ -4,10 +4,13 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from google import genai
 from google.genai import types
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.document_loaders import PyPDFLoader
-from langchain.vectorstores import Chroma
-from langchain.embeddings import VertexAIEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import VertexAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from vertexai.language_models import TextEmbeddingModel
+import pythainlp
+from pythainlp.tokenize import word_tokenize
 import base64
 import logging
 import os
@@ -31,62 +34,82 @@ line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 
+class ThaiTextSplitter(RecursiveCharacterTextSplitter):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def split_text(self, text: str) -> list[str]:
+        """Split text using Thai-aware splitting"""
+        # ใช้ pythainlp ในการแบ่งประโยค
+        sentences = pythainlp.sent_tokenize(text)
+        return super().split_text("\n".join(sentences))
+
+
 class RAGSystem:
     def __init__(self):
-        self.embeddings = VertexAIEmbeddings()
+        self.embedding_model = TextEmbeddingModel.from_pretrained("textembedding-gecko@001")
+        self.embeddings = VertexAIEmbeddings(
+            model_name="textembedding-gecko@001",
+            project="lexical-period-444405-e3",
+            location="us-central1"
+        )
         self.vector_store = None
-        self.chunk_size = 1000
-        self.chunk_overlap = 200
+        # ปรับขนาด chunk ให้เหมาะกับภาษาไทย
+        self.chunk_size = 500
+        self.chunk_overlap = 100
 
     def load_pdfs_from_folder(self, folder_path: str):
-        """Load all PDFs from specified folder"""
+        """Load all PDFs from specified folder with Thai support"""
         try:
-            # Get list of PDF files in the folder
             pdf_files = [f for f in os.listdir(folder_path) if f.endswith('.pdf')]
 
             all_texts = []
             for pdf_file in pdf_files:
                 pdf_path = os.path.join(folder_path, pdf_file)
-                logging.info(f"Processing PDF: {pdf_path}")
+                logging.info(f"กำลังประมวลผลไฟล์ PDF: {pdf_path}")
 
-                # Load PDF
+                # Load PDF with UTF-8 encoding
                 loader = PyPDFLoader(pdf_path)
                 documents = loader.load()
 
-                # Split documents into chunks
-                text_splitter = RecursiveCharacterTextSplitter(
+                # ใช้ Thai-aware text splitter
+                text_splitter = ThaiTextSplitter(
                     chunk_size=self.chunk_size,
-                    chunk_overlap=self.chunk_overlap
+                    chunk_overlap=self.chunk_overlap,
+                    length_function=len,
                 )
                 texts = text_splitter.split_documents(documents)
                 all_texts.extend(texts)
 
-            # Create vector store from all documents
             if all_texts:
                 self.vector_store = Chroma.from_documents(
                     documents=all_texts,
                     embedding=self.embeddings
                 )
-                logging.info(f"Successfully processed {len(pdf_files)} PDF files")
+                logging.info(f"ประมวลผลไฟล์ PDF สำเร็จ {len(pdf_files)} ไฟล์")
                 return True
             else:
-                logging.warning("No text content found in PDFs")
+                logging.warning("ไม่พบเนื้อหาในไฟล์ PDF")
                 return False
 
         except Exception as e:
-            logging.error(f"Error loading PDFs: {str(e)}")
+            logging.error(f"เกิดข้อผิดพลาดในการโหลด PDF: {str(e)}")
             return False
 
     def get_relevant_context(self, query, k=3):
-        """Retrieve relevant context based on query"""
+        """ค้นหาบริบทที่เกี่ยวข้องจากคำถาม"""
         if not self.vector_store:
             return ""
 
         try:
-            docs = self.vector_store.similarity_search(query, k=k)
+            # ใช้ word_tokenize สำหรับการแบ่งคำภาษาไทย
+            tokens = word_tokenize(query, engine="newmm")
+            processed_query = " ".join(tokens)
+
+            docs = self.vector_store.similarity_search(processed_query, k=k)
             return "\n".join([doc.page_content for doc in docs])
         except Exception as e:
-            logging.error(f"Error retrieving context: {str(e)}")
+            logging.error(f"เกิดข้อผิดพลาดในการค้นหาบริบท: {str(e)}")
             return ""
 
 
