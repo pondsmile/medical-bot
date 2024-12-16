@@ -1,8 +1,5 @@
 flask
 line-bot-sdk
 google-cloud-aiplatform
-pdfminer.six
-google-cloud-logging
-google-generativeai
+google-genai
 requests
-PyPDF2
