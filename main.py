@@ -13,8 +13,8 @@ from linebot.v3.exceptions import InvalidSignatureError
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain.embeddings import VertexEmbeddings
-from langchain.chat_models import ChatVertexAI
+from langchain_google_vertexai.embeddings import VertexAIEmbeddings
+from langchain_google_vertexai import ChatVertexAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 import logging
@@ -50,14 +50,14 @@ class RAGSystem:
         os.environ["GOOGLE_CLOUD_PROJECT"] = project_id
 
         # Initialize models
-        self.embeddings = VertexEmbeddings(
+        self.embeddings = VertexAIEmbeddings(
             model_name="textembedding-gecko",
             project=project_id,
             location=location,
         )
 
         self.llm = ChatVertexAI(
-            model_name="chat-bison",
+            model_name="gemini-pro",
             project=project_id,
             location=location,
             max_output_tokens=1024,
@@ -134,7 +134,7 @@ class RAGSystem:
     def load_knowledge_base(self):
         """Load existing knowledge base"""
         try:
-            self.vectorstore = FAISS.load_local("knowledge_base", self.embeddings)
+            self.vectorstore = FAISS.load_local("knowledge_base", self.embeddings,allow_dangerous_deserialization=True)
             retriever = self.vectorstore.as_retriever(
                 search_type="similarity",
                 search_kwargs={"k": 3}
