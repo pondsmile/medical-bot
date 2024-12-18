@@ -38,7 +38,7 @@ def query_agent(question):
     """Query the Agent Builder API and process the response"""
     try:
         # Get access token using gcloud
-        access_token = os.popen('gcloud auth print-access-token').read().strip()
+        access_token = "ya29.a0ARW5m76zzCeSSxlnQA4VsByoSI2jDUjq6RtBaz6gclYdPmUlUTjTcgW7obupFqzav9_1vFlKCj27lHPEVNMV7hXtYrx0R15fciiko4P_rUUWKiFWlV3dj7_KWQuRpL8iS0nlKlPDFcPF2iakaAe7n1MNzaQi3iYvsTSiUdcwXswKqAYaCgYKAcQSARISFQHGX2MiA2JpMRxtxfE88qNApcd6yQ0182"
 
         url = "https://discoveryengine.googleapis.com/v1alpha/projects/870818971718/locations/global/collections/default_collection/engines/gen-ai-chatbot_1734431977566/servingConfigs/default_search:answer"
 
